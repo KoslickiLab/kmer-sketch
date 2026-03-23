@@ -553,6 +553,16 @@ public:
         if (uni == 0) return 1.0;
         return double(inter) / double(uni);
     }
+    // containment_in(self, other): fraction of self's sketch elements found in other.
+    // Estimates C(self ⊆ other) = |self ∩ other| / |self|.
+    // Returns 1.0 when self is empty (vacuously contained).
+    static double containment_in(const FracMinHash& self, const FracMinHash& other) {
+        if (self.hashes_.empty()) return 1.0;
+        size_t inter = 0;
+        for (auto x : self.hashes_) if (other.hashes_.count(x)) ++inter;
+        return double(inter) / double(self.hashes_.size());
+    }
+
     static double cosine(const FracMinHash& a, const FracMinHash& b) {
         size_t inter = 0;
         if (a.hashes_.size() < b.hashes_.size()) {
@@ -649,6 +659,41 @@ public:
         if (uni == 0) return 1.0;
         return double(inter)/double(uni);
     }
+    // containment_in(self, other): estimates C(self ⊆ other) = |self ∩ other| / |self|.
+    // Returns 1.0 when self is empty (vacuously contained).
+    //
+    // For bottom-k sketches the naive estimator |self ∩ other| / |self| is biased
+    // when the two genomes differ in size: if other is larger, its sketch's k-th
+    // minimum (τ) is smaller than self's, so many of self's sketch elements lie
+    // above τ and are invisible to other's sketch — causing the naive estimator to
+    // undercount containment.
+    //
+    // We correct for this by restricting the denominator to only those elements of
+    // self that fall within other's sketch window (hash ≤ τ = max(other)):
+    //
+    //   C(self ⊆ other) ≈ |{x ∈ self : x ∈ other AND x ≤ τ}|
+    //                      ─────────────────────────────────────
+    //                         |{x ∈ self : x ≤ τ}|
+    //
+    // This is unbiased when both genomes have ≥ k k-mers.  When other has fewer
+    // than k k-mers its sketch is exhaustive (τ = max of other's hashes), so the
+    // estimator reduces to the naive form, which is exact in that case.
+    // Returns 0.0 when none of self's sketch elements fall within other's window.
+    static double containment_in(const BottomK& self, const BottomK& other) {
+        if (self.set_.empty()) return 1.0;
+        if (other.set_.empty()) return 0.0;
+        uint64_t tau = *std::max_element(other.set_.begin(), other.set_.end());
+        size_t denom = 0, inter = 0;
+        for (auto x : self.set_) {
+            if (x <= tau) {
+                ++denom;
+                if (other.set_.count(x)) ++inter;
+            }
+        }
+        if (denom == 0) return 0.0;
+        return double(inter) / double(denom);
+    }
+
     static double cosine(const BottomK& a, const BottomK& b) {
         size_t inter = 0;
         if (a.size() < b.size()) { for (auto x: a.set_) if (b.set_.count(x)) ++inter; }
