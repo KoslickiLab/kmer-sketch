@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <set>
@@ -35,21 +36,48 @@ static inline uint64_t hash_string_seeded(const std::string& s, uint64_t seed) {
 static void usage() {
     std::cerr
         << "Usage:\n"
-        << "  mgs_similarity_experiment "
-        << "--t FLOAT --metric {jaccard|cosine} "
+        << "  expt_growth "
+        << "--t FLOAT --metric {jaccard|cosine|containment} "
         << "[--k K=50] [--seeds N=50] [--base_n N=1000] [--steps S=10] "
         << "[--growth {x2|x10}=x2] [--out PATH=results/mgs_similarity_experiment] "
-        << "[--seed SEED=42] [--w W=64] "
+        << "[--seed SEED=42] [--w W=64] [--size_multiplier R=1 (containment only)] "
         << "[--algo {maxgeom|alphamaxgeom|fracminhash|minhash|bottomk}=maxgeom] "
         << "[--alpha A=0.5] [--scale S=0.1] [--num-perm M=128]\n";
 }
 
 static std::string get_arg(std::vector<std::string>& args, const std::string& key, const std::string& def="") {
-    for (size_t i=0;i+1<args.size();++i) if (args[i]==key) return args[i+1];
+    for (size_t i=0;i<args.size();++i) if (args[i]==key) {
+        if (i+1 == args.size()) throw std::runtime_error("Missing value for " + key);
+        return args[i+1];
+    }
     return def;
 }
 static bool has_flag(const std::vector<std::string>& args, const std::string& key) {
     return std::find(args.begin(), args.end(), key) != args.end();
+}
+
+static size_t size_arg(std::vector<std::string>& args, const std::string& key, const std::string& def) {
+    const std::string value = get_arg(args, key, def);
+    size_t used = 0;
+    if (value.empty() || value[0] == '-') throw std::runtime_error("Invalid " + key);
+    const auto n = std::stoull(value, &used);
+    if (used != value.size() || n > std::numeric_limits<size_t>::max())
+        throw std::runtime_error("Invalid " + key);
+    return static_cast<size_t>(n);
+}
+
+static double double_arg(std::vector<std::string>& args, const std::string& key, const std::string& def) {
+    const std::string value = get_arg(args, key, def);
+    size_t used = 0;
+    const double x = std::stod(value, &used);
+    if (used != value.size() || !std::isfinite(x)) throw std::runtime_error("Invalid " + key);
+    return x;
+}
+
+static size_t checked_product(size_t a, size_t b) {
+    if (b && a > std::numeric_limits<size_t>::max() / b)
+        throw std::runtime_error("Set size overflow; reduce --base_n, --steps, or --size_multiplier");
+    return a * b;
 }
 
 // ----------------------- Random string generation ----------------------------
@@ -119,6 +147,23 @@ synthesize_sets_cosine(double t, size_t n, const std::vector<std::string>& pool,
     return {std::move(A), std::move(B)};
 }
 
+// Implicit distinct integer sets: A = [0,nA), B = [0,shared) plus
+// [nA,nA+nB-shared). This avoids a huge pool, shuffle, and string/set storage.
+struct ContainmentSets { size_t nA, nB, shared; };
+static ContainmentSets synthesize_sets_containment(double t, size_t n, double multiplier) {
+    const long double nB = std::round(static_cast<long double>(n) * multiplier);
+    const long double limit = std::ldexp(1.0L, std::numeric_limits<size_t>::digits);
+    if (!std::isfinite(nB) || nB < 1 || nB >= limit)
+        throw std::runtime_error("--size_multiplier produces an empty or overflowing B");
+    ContainmentSets sets{n, static_cast<size_t>(nB),
+                         static_cast<size_t>(std::round(static_cast<long double>(n) * t))};
+    if (sets.shared > sets.nB)
+        throw std::runtime_error("Target containment requires more shared elements than |B|");
+    if (sets.nB - sets.shared > std::numeric_limits<size_t>::max() - n)
+        throw std::runtime_error("Union size overflow; reduce set sizes");
+    return sets;
+}
+
 // -------------------------- MSE helper ---------------------------------------
 static inline double mse(const std::vector<double>& vs, double target) {
     if (vs.empty()) return std::numeric_limits<double>::quiet_NaN();
@@ -160,7 +205,11 @@ static double effective_sample_size(const SketchT& s) {
 }
 
 // -------------------------- Estimation helpers -------------------------------
-enum class Metric { Jaccard, Cosine };
+enum class Metric { Jaccard, Cosine, Containment };
+static const char* metric_name(Metric metric) {
+    return metric == Metric::Jaccard ? "jaccard"
+         : metric == Metric::Cosine ? "cosine" : "containment";
+}
 struct EstResult { double estimate=std::numeric_limits<double>::quiet_NaN(); double sampleA=0.0; double sampleB=0.0; };
 
 // MaxGeom: member jaccard/cosine
@@ -246,6 +295,24 @@ static EstResult estimate_bottomk(const std::unordered_set<std::string>& A,
     return r;
 }
 
+template <typename SketchT>
+static EstResult estimate_containment(const ContainmentSets& sets, uint64_t seed,
+                                      SketchT sA, SketchT sB) {
+    // The same seeded permutation hashes each distinct ID in both sets.
+    // Shared elements are hashed once; no input-sized allocation is needed.
+    for (size_t i = 0; i < sets.shared; ++i) {
+        const uint64_t h = splitmix64(uint64_t(i) ^ seed);
+        sA.add_hash(h);
+        sB.add_hash(h);
+    }
+    for (size_t i = sets.shared; i < sets.nA; ++i)
+        sA.add_hash(splitmix64(uint64_t(i) ^ seed));
+    const size_t end = sets.nA + (sets.nB - sets.shared);
+    for (size_t i = sets.nA; i < end; ++i)
+        sB.add_hash(splitmix64(uint64_t(i) ^ seed));
+    return {sA.containment_in(sB), effective_sample_size(sA), effective_sample_size(sB)};
+}
+
 // ---------------------------- Experiment core --------------------------------
 static void run_experiment(double t,
                            Metric metric,
@@ -260,16 +327,24 @@ static void run_experiment(double t,
                            size_t w,          // for (Alpha)MaxGeom
                            double alpha,      // AlphaMaxGeom
                            double scale,      // FracMinHash
-                           size_t num_perm)   // MinHash
+                           size_t num_perm,   // MinHash
+                           double size_multiplier)
 {
     uint64_t scale_factor = (growth=="x2") ? 2 : (growth=="x10") ? 10 : 0;
     if (!scale_factor) throw std::runtime_error("growth must be 'x2' or 'x10'");
 
     std::mt19937_64 rng(global_seed);
 
-    const size_t max_size_needed = base_n * static_cast<size_t>(std::pow(scale_factor, steps ? (steps - 1) : 0)) * 2;
-    const size_t pool_size = std::max<size_t>(max_size_needed, 1);
-    auto universal_pool = generate_random_strings(pool_size, /*length=*/10, rng);
+    size_t max_n = base_n;
+    for (size_t step = 1; step < steps; ++step) max_n = checked_product(max_n, scale_factor);
+    std::vector<std::string> universal_pool;
+    if (metric == Metric::Containment) {
+        // Validate the entire growth schedule before running or creating output.
+        synthesize_sets_containment(t, base_n, size_multiplier);
+        synthesize_sets_containment(t, max_n, size_multiplier);
+    } else {
+        universal_pool = generate_random_strings(checked_product(max_n, 2), /*length=*/10, rng);
+    }
 
     std::filesystem::path outp(out_path);
     if (outp.has_parent_path() && !outp.parent_path().empty())
@@ -278,17 +353,21 @@ static void run_experiment(double t,
     {   // header
         std::ofstream f(out_path, std::ios::trunc);
         if (!f) throw std::runtime_error("Cannot open output file: " + out_path);
-        f << "metric\tk\tstep\t|A|\t|B|\tmean_sample_size_A\tmean_sample_size_B\ttrue_sim\tmean_est\tmse\n";
+        f << "metric\tk\tstep\t|A|\t|B|\tmean_sample_size_A\tmean_sample_size_B\ttrue_sim\tmean_est\tmse";
+        if (metric == Metric::Containment) f << "\tvalid_seeds";
+        f << '\n';
     }
 
     std::vector<uint64_t> seeds(seeds_per_size);
     std::iota(seeds.begin(), seeds.end(), 0ULL);
 
+    size_t n = base_n;
     for (size_t step = 0; step < steps; ++step) {
-        const size_t n = static_cast<size_t>(static_cast<long double>(base_n) * std::pow(static_cast<long double>(scale_factor), static_cast<long double>(step)));
-
         std::unordered_set<std::string> A, B;
-        if (metric == Metric::Jaccard) {
+        ContainmentSets sets{0, 0, 0};
+        if (metric == Metric::Containment) {
+            sets = synthesize_sets_containment(t, n, size_multiplier);
+        } else if (metric == Metric::Jaccard) {
             std::tie(A, B) = synthesize_sets_jaccard(t, n, universal_pool, rng);
         } else {
             std::tie(A, B) = synthesize_sets_cosine(t, n, universal_pool, rng);
@@ -303,17 +382,31 @@ static void run_experiment(double t,
             for (auto& s : B) if (A.count(s)) ++inter;
         }
 
-        const double true_j = double(inter) / double(A.size() + B.size() - inter);
-        const double true_c = double(inter) / std::sqrt(double(A.size()) * double(B.size()));
-        const double true_sim = (metric == Metric::Jaccard) ? true_j : true_c;
+        const size_t nA = metric == Metric::Containment ? sets.nA : A.size();
+        const size_t nB = metric == Metric::Containment ? sets.nB : B.size();
+        if (metric == Metric::Containment) inter = sets.shared;
+        const double true_sim = metric == Metric::Containment ? double(inter) / double(nA)
+                              : metric == Metric::Jaccard ? double(inter) / double(nA + nB - inter)
+                              : double(inter) / std::sqrt(double(nA) * double(nB));
 
         std::vector<double> ests; ests.reserve(seeds.size());
         long double sum_sA = 0.0L, sum_sB = 0.0L;
 
         for (uint64_t s : seeds) {
-            std::cout << "Step " << step << ", n=" << n << ", seed=" << s << "\n";
+            if (metric != Metric::Containment)
+                std::cout << "Step " << step << ", n=" << n << ", seed=" << s << "\n";
             EstResult r;
-            if (algo == "maxgeom") {
+            if (metric == Metric::Containment) {
+                const uint64_t hash_seed = splitmix64(s ^ splitmix64(global_seed + step));
+                if (algo == "maxgeom")
+                    r = estimate_containment(sets, hash_seed, MaxGeomSample(k, w, hash_seed), MaxGeomSample(k, w, hash_seed));
+                else if (algo == "alphamaxgeom")
+                    r = estimate_containment(sets, hash_seed, AlphaMaxGeomSample(alpha, w, hash_seed), AlphaMaxGeomSample(alpha, w, hash_seed));
+                else if (algo == "fracminhash")
+                    r = estimate_containment(sets, hash_seed, FracMinHash(scale, hash_seed), FracMinHash(scale, hash_seed));
+                else if (algo == "bottomk")
+                    r = estimate_containment(sets, hash_seed, BottomK(k, hash_seed), BottomK(k, hash_seed));
+            } else if (algo == "maxgeom") {
                 r = estimate_maxgeom(A, B, s, metric, k, w);
             } else if (algo == "alphamaxgeom") {
                 r = estimate_alphamaxgeom(A, B, s, metric, alpha, w);
@@ -326,7 +419,8 @@ static void run_experiment(double t,
             } else {
                 throw std::runtime_error("Unsupported --algo: " + algo + " (valid: maxgeom, alphamaxgeom, fracminhash, minhash, bottomk)");
             }
-            ests.push_back(r.estimate);
+            if (metric != Metric::Containment || std::isfinite(r.estimate))
+                ests.push_back(r.estimate);
             sum_sA += r.sampleA;
             sum_sB += r.sampleB;
         }
@@ -348,29 +442,36 @@ static void run_experiment(double t,
 
         std::ofstream f(out_path, std::ios::app);
         if (!f) throw std::runtime_error("Cannot open output file for append: " + out_path);
-        f << (metric == Metric::Jaccard ? "jaccard" : "cosine") << '\t'
+        f << metric_name(metric) << '\t'
           << k_col << '\t'
           << step << '\t'
-          << A.size() << '\t'
-          << B.size() << '\t'
+          << nA << '\t'
+          << nB << '\t'
           << std::fixed << std::setprecision(6) << mean_sA << '\t'
           << std::fixed << std::setprecision(6) << mean_sB << '\t'
           << std::fixed << std::setprecision(6) << true_sim << '\t'
           << std::fixed << std::setprecision(6) << mean_est << '\t'
-          << std::scientific << std::setprecision(6) << err
-          << '\n';
+          << std::scientific << std::setprecision(6) << err;
+        if (metric == Metric::Containment) f << '\t' << ests.size();
+        f << '\n';
+        if (metric == Metric::Containment && ests.size() != seeds.size())
+            std::cerr << "WARNING: step " << step << ": " << seeds.size() - ests.size()
+                      << " trials had no sampled A elements in the common sample; mean_est and mse use "
+                      << ests.size() << "/" << seeds.size()
+                      << " valid trials. Increase the sketch size or sampling rate.\n";
 
         std::cerr << "Step " << step << " done: n=" << n
                   << " true=" << true_sim
                   << " mean_est=" << mean_est
                   << " mse=" << err << "\n";
+        if (step + 1 < steps) n = checked_product(n, scale_factor);
     }
 
     std::cout << "\nResults written to:\n" << out_path << "\n";
 }
 
 // --------------------------------- main --------------------------------------
-int main(int argc, char** argv) {
+static int run_cli(int argc, char** argv) {
     if (argc < 2) { usage(); return 1; }
     std::vector<std::string> args(argv+1, argv+argc);
     if (has_flag(args, "-h") || has_flag(args, "--help")) { usage(); return 0; }
@@ -381,35 +482,54 @@ int main(int argc, char** argv) {
         usage(); std::cerr << "\nMissing required --t or --metric.\n"; return 2;
     }
 
-    double t = 0.0;
-    try { t = std::stod(t_str); } catch (...) { std::cerr << "Invalid --t\n"; return 2; }
+    const double t = double_arg(args, "--t", "");
+    if (t < 0.0 || t > 1.0) throw std::runtime_error("--t must be in [0,1]");
 
     Metric metric;
     if (metric_str == "jaccard" || metric_str == "Jaccard") metric = Metric::Jaccard;
     else if (metric_str == "cosine" || metric_str == "Cosine") metric = Metric::Cosine;
-    else { std::cerr << "Invalid --metric (use jaccard or cosine)\n"; return 2; }
+    else if (metric_str == "containment" || metric_str == "Containment") metric = Metric::Containment;
+    else { std::cerr << "Invalid --metric (use jaccard, cosine, or containment)\n"; return 2; }
 
-    size_t k       = static_cast<size_t>(std::stoull(get_arg(args, "--k", "50")));
-    size_t seeds   = static_cast<size_t>(std::stoull(get_arg(args, "--seeds", "50")));
-    size_t base_n  = static_cast<size_t>(std::stoull(get_arg(args, "--base_n", "1000")));
-    size_t steps   = static_cast<size_t>(std::stoull(get_arg(args, "--steps", "10")));
+    size_t k       = size_arg(args, "--k", "50");
+    size_t seeds   = size_arg(args, "--seeds", "50");
+    size_t base_n  = size_arg(args, "--base_n", "1000");
+    size_t steps   = size_arg(args, "--steps", "10");
     std::string growth = get_arg(args, "--growth", "x2");
     std::string out = get_arg(args, "--out", "results/mgs_similarity_experiment");
-    uint64_t seed  = static_cast<uint64_t>(std::stoull(get_arg(args, "--seed", "42")));
-    size_t w       = static_cast<size_t>(std::stoull(get_arg(args, "--w", "64")));
+    uint64_t seed  = size_arg(args, "--seed", "42");
+    size_t w       = size_arg(args, "--w", "64");
     std::string algo = get_arg(args, "--algo", "maxgeom");
 
-    double alpha   = std::stod(get_arg(args, "--alpha", "0.5"));
-    double scale   = std::stod(get_arg(args, "--scale", "0.1"));
-    size_t num_perm = static_cast<size_t>(std::stoull(get_arg(args, "--num-perm", "128")));
+    double alpha   = double_arg(args, "--alpha", "0.5");
+    double scale   = double_arg(args, "--scale", "0.1");
+    size_t num_perm = size_arg(args, "--num-perm", "128");
+
+    const double size_multiplier = double_arg(args, "--size_multiplier", "1");
+    if (size_multiplier <= 0.0) throw std::runtime_error("--size_multiplier must be positive");
+    if (!base_n || !steps || !seeds) throw std::runtime_error("--base_n, --steps, and --seeds must be positive");
+    if (algo != "maxgeom" && algo != "alphamaxgeom" && algo != "fracminhash" && algo != "minhash" && algo != "bottomk")
+        throw std::runtime_error("Unsupported --algo: " + algo);
+    if ((algo == "maxgeom" || algo == "bottomk") && !k) throw std::runtime_error("--k must be positive");
+    if ((algo == "maxgeom" || algo == "alphamaxgeom") && (w < 1 || w > 64)) throw std::runtime_error("--w must be in [1,64]");
+    if (algo == "alphamaxgeom" && !(alpha > 0.0 && alpha < 1.0)) throw std::runtime_error("--alpha must be in (0,1)");
+    if (algo == "fracminhash" && !(scale > 0.0 && scale <= 1.0)) throw std::runtime_error("--scale must be in (0,1]");
+    if (algo == "minhash" && !num_perm) throw std::runtime_error("--num-perm must be positive");
+    if (metric == Metric::Containment) {
+        if (algo == "minhash") throw std::runtime_error("Containment supports maxgeom, alphamaxgeom, fracminhash, and bottomk; not minhash");
+        if (t > size_multiplier) throw std::runtime_error("Containment target cannot exceed --size_multiplier");
+    } else if (size_multiplier != 1.0) {
+        throw std::runtime_error("--size_multiplier is only supported with --metric containment");
+    }
 
     std::cout << "Running with the following parameters:\n";
     std::cout << "  t: " << t << "\n";
-    std::cout << "  metric: " << (metric == Metric::Jaccard ? "jaccard" : "cosine") << "\n";
+    std::cout << "  metric: " << metric_name(metric) << "\n";
     std::cout << "  algo: " << algo << "\n";
     std::cout << "  k: " << k << "  (used by: maxgeom, bottomk; for minhash this is ignored in favor of --num-perm)\n";
     std::cout << "  seeds: " << seeds << "\n";
     std::cout << "  base_n: " << base_n << "\n";
+    if (metric == Metric::Containment) std::cout << "  size_multiplier: " << size_multiplier << "\n";
     std::cout << "  steps: " << steps << "\n";
     std::cout << "  growth: " << growth << "\n";
     std::cout << "  out: " << out << "\n";
@@ -419,11 +539,15 @@ int main(int argc, char** argv) {
     std::cout << "  scale: " << scale << "  (used by: fracminhash)\n";
     std::cout << "  num-perm: " << num_perm << "  (used by: minhash)\n";
 
+    run_experiment(t, metric, algo, k, seeds, base_n, steps, growth, out, seed, w, alpha, scale, num_perm, size_multiplier);
+    return 0;
+}
+
+int main(int argc, char** argv) {
     try {
-        run_experiment(t, metric, algo, k, seeds, base_n, steps, growth, out, seed, w, alpha, scale, num_perm);
+        return run_cli(argc, argv);
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
         return 3;
     }
-    return 0;
 }

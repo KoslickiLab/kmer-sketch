@@ -13,6 +13,8 @@
 #include <limits>
 #include <iostream>
 #include <sstream>
+#include <functional>
+#include <utility>
 
 #include "Hash.hpp"
 
@@ -24,6 +26,45 @@ struct SketchInfo {
     uint64_t seed = 42;
     std::string hash_function = "MurmurHash3_x64_128_low64";
 };
+
+// Containment is directional: |A intersect B| / |A|. Reconstruct each
+// capacity-limited union bucket, then count its A elements and shared elements.
+// No surviving A elements means insufficient evidence, not containment 0 or 1.
+namespace sketch_detail {
+template <typename Buckets, typename Capacity>
+double geometric_containment(const Buckets& a, const Buckets& b, Capacity capacity) {
+    if (a.empty()) return 1.0; // A really is empty (geometric sketches retain elements).
+    size_t inter = 0, denom = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> kept; // (hprime, full hash)
+    for (const auto& [i, bucket_a] : a) {
+        auto it = b.find(i);
+        if (it == b.end()) {
+            denom += bucket_a.size(); // A-only buckets must not disappear.
+            continue;
+        }
+        const auto& bucket_b = it->second;
+        kept.clear();
+        kept.reserve(bucket_a.size() + bucket_b.size());
+        for (const auto& [h, e] : bucket_a) kept.emplace_back(e.hprime, h);
+        for (const auto& [h, e] : bucket_b)
+            if (!bucket_a.count(h)) kept.emplace_back(e.hprime, h);
+        const size_t cap = capacity(i);
+        if (kept.size() > cap) {
+            std::nth_element(kept.begin(), kept.begin() + cap, kept.end(),
+                             std::greater<std::pair<uint64_t, uint64_t>>());
+            kept.resize(cap);
+        }
+        for (const auto& [hp, h] : kept) {
+            if (bucket_a.count(h)) {
+                ++denom;
+                if (bucket_b.count(h)) ++inter;
+            }
+        }
+    }
+    return denom ? double(inter) / double(denom)
+                 : std::numeric_limits<double>::quiet_NaN();
+}
+} // namespace sketch_detail
 
 class MaxGeomSample {
 public:
@@ -44,6 +85,8 @@ public:
         uint64_t hprime = tail_after_leftmost_one(h, i);
         auto& bucket = buckets_[i];
         auto& heap = heaps_[i];
+        if (bucket.size() == b_ && !heap.empty() &&
+            std::make_pair(hprime, h) < heap.top()) return;
         auto it = bucket.find(h);
         if (it != bucket.end()) {
             it->second.freq += 1;
@@ -53,7 +96,7 @@ public:
             bucket.emplace(h, Entry{h, hprime, 1});
             heap.emplace(hprime, h);
         } else {
-            if (!heap.empty() && hprime > heap.top().first) {
+            if (!heap.empty() && std::make_pair(hprime, h) > heap.top()) {
                 bucket.emplace(h, Entry{h, hprime, 1});
                 heap.emplace(hprime, h);
                 evict_smallest(i);
@@ -93,47 +136,11 @@ public:
 
 
     double containment_in(const MaxGeomSample& other) const {
-        if (w_ != other.w_ || b_ != other.b_)
-            throw std::runtime_error("Incompatible MaxGeomSample for Containment (w or b differ)");
-        size_t inter_sum = 0, denom_sum = 0;
-
-        for (const auto& kv : buckets_) {
-            size_t i = kv.first;
-            auto it2 = other.buckets_.find(i);
-            if (it2 == other.buckets_.end()) continue;
-
-            // Build sets of h' (dedup within bucket)
-            std::unordered_set<uint64_t> self_hprimes; self_hprimes.reserve(kv.second.size()*2);
-            for (const auto& e : kv.second) self_hprimes.insert(e.second.hprime);
-
-            std::unordered_set<uint64_t> other_hprimes; other_hprimes.reserve(it2->second.size()*2);
-            for (const auto& e : it2->second) other_hprimes.insert(e.second.hprime);
-
-            // Capacity-limited union (descending, then unique, capped at k_)
-            std::vector<uint64_t> uni; uni.reserve(self_hprimes.size() + other_hprimes.size());
-            for (auto x: self_hprimes) uni.push_back(x);
-            for (auto x: other_hprimes) uni.push_back(x);
-            std::sort(uni.begin(), uni.end(), std::greater<uint64_t>());
-            uni.erase(std::unique(uni.begin(), uni.end()), uni.end());
-            if (uni.size() > b_) uni.resize(b_);
-
-            std::unordered_set<uint64_t> allow(uni.begin(), uni.end());
-
-            // Denominator = how many of self's kept elements survive capacity cap
-            size_t denom_bucket = 0;
-            for (auto x : self_hprimes) if (allow.count(x)) ++denom_bucket;
-
-            // Intersection = overlap that also survives capacity cap
-            size_t inter_bucket = 0;
-            for (auto x : self_hprimes) if (allow.count(x) && other_hprimes.count(x)) ++inter_bucket;
-
-            denom_sum += denom_bucket;
-            inter_sum += inter_bucket;
-        }
-        if (denom_sum == 0) return 1.0; // both empty under caps ⇒ define containment as 1
-        return double(inter_sum) / double(denom_sum);
+        if (w_ != other.w_ || b_ != other.b_ || seed_ != other.seed_)
+            throw std::runtime_error("Incompatible MaxGeomSample for Containment (w, b, or seed differ)");
+        return sketch_detail::geometric_containment(buckets_, other.buckets_,
+                                                    [this](size_t) { return b_; });
     }
-
 
     double cosine(const MaxGeomSample& other) const {
         if (w_ != other.w_ || b_ != other.b_) throw std::runtime_error("Incompatible MaxGeomSample for Cosine");
@@ -268,7 +275,7 @@ private:
     std::unordered_map<size_t, std::unordered_map<uint64_t, Entry>> buckets_;
     struct MinCmp { bool operator()(const std::pair<uint64_t,uint64_t>& a,
                                     const std::pair<uint64_t,uint64_t>& b) const {
-                        return a.first > b.first;
+                        return a > b;
                     } };
     std::unordered_map<size_t, std::priority_queue<std::pair<uint64_t,uint64_t>,
                                                    std::vector<std::pair<uint64_t,uint64_t> >,
@@ -288,7 +295,9 @@ public:
         for (size_t i=0; i<=w_; ++i) {
             double val = std::pow(2.0, beta * (double)i);
             // take ceiling of val
-            size_t b = (size_t)std::ceil(val);
+            size_t b = val >= double(std::numeric_limits<size_t>::max())
+                         ? std::numeric_limits<size_t>::max()
+                         : static_cast<size_t>(std::ceil(val));
             if (b < 1) b = 1;
             b_sizes_[i] = b;
         }
@@ -299,6 +308,8 @@ public:
         uint64_t hprime = tail_after_leftmost_one(h, i);
         auto& bucket = buckets_[i];
         auto& heap = heaps_[i];
+        if (bucket.size() == b_sizes_[i] && !heap.empty() &&
+            std::make_pair(hprime, h) < heap.top()) return;
         auto it = bucket.find(h);
         if (it != bucket.end()) {
             it->second.freq += 1;
@@ -308,7 +319,7 @@ public:
             bucket.emplace(h, Entry{h,hprime,1});
             heap.emplace(hprime, h);
         } else {
-            if (!heap.empty() && hprime > heap.top().first) {
+            if (!heap.empty() && std::make_pair(hprime, h) > heap.top()) {
                 bucket.emplace(h, Entry{h,hprime,1});
                 heap.emplace(hprime, h);
                 evict_smallest(i);
@@ -348,43 +359,10 @@ public:
     }
 
     double containment_in(const AlphaMaxGeomSample& other) const {
-        if (w_ != other.w_ || alpha_ != other.alpha_)
-            throw std::runtime_error("Incompatible AlphaMaxGeomSample for Containment (w or alpha differ)");
-        size_t inter_sum = 0, denom_sum = 0;
-
-        for (const auto& kv : buckets_) {
-            size_t i = kv.first;
-            auto it2 = other.buckets_.find(i);
-            if (it2 == other.buckets_.end()) continue;
-
-            std::unordered_set<uint64_t> self_hprimes; self_hprimes.reserve(kv.second.size()*2);
-            for (const auto& e : kv.second) self_hprimes.insert(e.second.hprime);
-
-            std::unordered_set<uint64_t> other_hprimes; other_hprimes.reserve(it2->second.size()*2);
-            for (const auto& e : it2->second) other_hprimes.insert(e.second.hprime);
-
-            // Capacity-limited union (cap depends on bucket i)
-            std::vector<uint64_t> uni; uni.reserve(self_hprimes.size() + other_hprimes.size());
-            for (auto x: self_hprimes) uni.push_back(x);
-            for (auto x: other_hprimes) uni.push_back(x);
-            std::sort(uni.begin(), uni.end(), std::greater<uint64_t>());
-            uni.erase(std::unique(uni.begin(), uni.end()), uni.end());
-            size_t cap = b_sizes_[i];
-            if (uni.size() > cap) uni.resize(cap);
-
-            std::unordered_set<uint64_t> allow(uni.begin(), uni.end());
-
-            size_t denom_bucket = 0;
-            for (auto x : self_hprimes) if (allow.count(x)) ++denom_bucket;
-
-            size_t inter_bucket = 0;
-            for (auto x : self_hprimes) if (allow.count(x) && other_hprimes.count(x)) ++inter_bucket;
-
-            denom_sum += denom_bucket;
-            inter_sum += inter_bucket;
-        }
-        if (denom_sum == 0) return 1.0;
-        return double(inter_sum) / double(denom_sum);
+        if (w_ != other.w_ || alpha_ != other.alpha_ || seed_ != other.seed_)
+            throw std::runtime_error("Incompatible AlphaMaxGeomSample for Containment (w, alpha, or seed differ)");
+        return sketch_detail::geometric_containment(buckets_, other.buckets_,
+                                                    [this](size_t i) { return b_sizes_[i]; });
     }
 
     double cosine(const AlphaMaxGeomSample& other) const {
@@ -521,7 +499,7 @@ private:
     std::unordered_map<size_t, std::unordered_map<uint64_t, Entry>> buckets_;
     struct MinCmp { bool operator()(const std::pair<uint64_t,uint64_t>& a,
                                     const std::pair<uint64_t,uint64_t>& b) const {
-                        return a.first > b.first;
+                        return a > b;
                     } };
     std::unordered_map<size_t, std::priority_queue<std::pair<uint64_t,uint64_t>,
                                                    std::vector<std::pair<uint64_t,uint64_t> >,
@@ -533,7 +511,8 @@ public:
     explicit FracMinHash(double scale, uint64_t seed=42)
         : scale_(scale), seed_(seed) {
         if (!(scale_ > 0.0 && scale_ <= 1.0)) throw std::runtime_error("scale must be in (0,1]");
-        threshold_ = (uint64_t)(scale_ * double(HASH_MAX));
+        // double(HASH_MAX) rounds to 2^64; casting that at scale=1 is undefined.
+        threshold_ = scale_ == 1.0 ? HASH_MAX : uint64_t(scale_ * double(HASH_MAX));
     }
 
     void add_hash(uint64_t h) {
@@ -562,6 +541,22 @@ public:
         }
         if (a.hashes_.empty() || b.hashes_.empty()) return 1.0;
         return double(inter) / std::sqrt(double(a.hashes_.size()) * double(b.hashes_.size()));
+    }
+
+    double containment_in(const FracMinHash& other) const {
+        if (seed_ != other.seed_)
+            throw std::runtime_error("Incompatible FracMinHash for Containment (seeds differ)");
+        const uint64_t threshold = std::min(threshold_, other.threshold_);
+        size_t inter = 0, denom = 0;
+        for (auto h : hashes_) {
+            if (h <= threshold) {
+                ++denom;
+                if (other.hashes_.count(h)) ++inter;
+            }
+        }
+        // An empty FracMinHash sample does not establish that A is empty.
+        return denom ? double(inter) / double(denom)
+                     : std::numeric_limits<double>::quiet_NaN();
     }
 
     void write(std::ostream& out, size_t kmer_size) const {
@@ -626,6 +621,7 @@ public:
         if (k_ == 0) throw std::runtime_error("k must be positive");
     }
     void add_hash(uint64_t h) {
+        if (set_.size() == k_ && h > heap_.top()) return;
         if (set_.count(h)) return;
         if (set_.size() < k_) {
             set_.insert(h);
@@ -655,6 +651,38 @@ public:
         else { for (auto x: b.set_) if (a.set_.count(x)) ++inter; }
         if (a.size()==0 || b.size()==0) return 1.0;
         return double(inter) / std::sqrt(double(a.size())*double(b.size()));
+    }
+
+    double containment_in(const BottomK& other) const {
+        if (seed_ != other.seed_)
+            throw std::runtime_error("Incompatible BottomK for Containment (seeds differ)");
+        if (set_.empty()) return 1.0; // A is truly empty.
+        if (other.set_.empty()) return 0.0;
+        // If both sketches are untruncated, use the exact sets.
+        if (size() < k_ && other.size() < other.k_) {
+            size_t inter = 0;
+            for (auto h : set_) if (other.set_.count(h)) ++inter;
+            return double(inter) / double(size());
+        }
+        // Raw sketch overlap / |sketch(A)| is wrong for unequal input sizes.
+        // Reconstruct bottom-k(A union B), a coordinated sample of the union.
+        std::vector<uint64_t> kept(set_.begin(), set_.end());
+        kept.reserve(size() + other.size());
+        for (auto h : other.set_) if (!set_.count(h)) kept.push_back(h);
+        const size_t cap = std::min(k_, other.k_);
+        if (kept.size() > cap) {
+            std::nth_element(kept.begin(), kept.begin() + cap, kept.end());
+            kept.resize(cap);
+        }
+        size_t inter = 0, denom = 0;
+        for (auto h : kept) {
+            if (set_.count(h)) {
+                ++denom;
+                if (other.set_.count(h)) ++inter;
+            }
+        }
+        return denom ? double(inter) / double(denom)
+                     : std::numeric_limits<double>::quiet_NaN();
     }
 
     void write(std::ostream& out, size_t kmer_size) const {
