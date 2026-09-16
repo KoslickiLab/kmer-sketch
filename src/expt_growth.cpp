@@ -392,9 +392,12 @@ static void run_experiment(double t,
         std::vector<double> ests; ests.reserve(seeds.size());
         long double sum_sA = 0.0L, sum_sB = 0.0L;
 
+        size_t trial = 0;
         for (uint64_t s : seeds) {
-            if (metric != Metric::Containment)
-                std::cout << "Step " << step << ", n=" << n << ", seed=" << s << "\n";
+            ++trial;
+            std::cerr << "Step " << step << ", n=" << n
+                      << ", experiment=" << trial << "/" << seeds.size()
+                      << " (seed=" << s << ")\n" << std::flush;
             EstResult r;
             if (metric == Metric::Containment) {
                 const uint64_t hash_seed = splitmix64(s ^ splitmix64(global_seed + step));
