@@ -397,7 +397,7 @@ static void run_experiment(double t,
             ++trial;
             std::cerr << "Step " << step << ", n=" << n
                       << ", experiment=" << trial << "/" << seeds.size()
-                      << " (seed=" << s << ")\n" << std::flush;
+                      << " (seed=" << s << ")\r" << std::flush;
             EstResult r;
             if (metric == Metric::Containment) {
                 const uint64_t hash_seed = splitmix64(s ^ splitmix64(global_seed + step));
