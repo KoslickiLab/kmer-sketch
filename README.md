@@ -12,7 +12,6 @@ A C++ implementation of MaxGeomHash and $\alpha$-MaxGeomHash for
 4. [Detailed usage](#detailed-usage)
    - [`sketch`](#sketch)
    - [`pwsimilarity`](#pwsimilarity)
-   - [`expt_growth`](#expt_growth)
 5. [Citing](#citing)
 
 ## Overview
@@ -91,61 +90,6 @@ This program computes pairwise similarity from a list of sketch files. The argum
 | `SKETCH1 SKETCH2 ...`  | list of file paths | **required**   | Input sketch files to compare pairwise. |
 
 
-## `expt_growth`
-
-Run repeated-seed experiments at growing set sizes. Jaccard and cosine retain
-the existing equal-size set synthesis. Containment is directional:
-`C(A,B) = |A intersect B| / |A|`, not overlap divided by the smaller set size.
-
-```bash
-bin/expt_growth --t 0.5 --metric containment --seeds 500 --steps 10 \
-  --growth x2 --out results/fixed_containment_expt_amgh_t0.5_a0.45 \
-  --algo alphamaxgeom --alpha 0.45 --base_n 100000 --size_multiplier 40
-```
-
-For step `s` (starting at zero), `|A| = base_n * growth_factor^s`,
-`|B| = round(|A| * size_multiplier)`, and the intersection contains
-`round(t * |A|)` distinct elements. Thus the example starts with 100,000 and
-4,000,000 elements, then 200,000 and 8,000,000, and so on. `true_sim` records
-the realized containment after integer rounding; MSE is measured against this
-value, not the unrounded target. `--growth` accepts `x2` or `x10`.
-
-`--size_multiplier` defaults to 1 and accepts positive finite numbers. Values
-below 1 are allowed when the target fits inside B (`t <= size_multiplier`).
-Empty rounded B sizes and overflowing growth schedules are rejected. Non-unit
-multipliers require `--metric containment`.
-
-Containment supports `alphamaxgeom`, `maxgeom`, `bottomk`, and `fracminhash`.
-Use `--k` for MaxGeom bucket capacity or bottom-k sketch size, `--alpha` for
-AlphaMaxGeom, and `--scale` for FracMinHash. For example, replace the algorithm
-options in the command above with `--algo maxgeom --k 50`,
-`--algo bottomk --k 2000`, or `--algo fracminhash --scale 0.001`.
-Classical `--algo minhash` is not supported for containment; it fails explicitly
-rather than silently returning a different metric. This section describes
-`expt_growth`; the `pwsimilarity` CLI remains unchanged.
-
-Containment output keeps the existing TSV columns and appends `valid_seeds`.
-All requested trials run, but a trial with no A elements in the coordinated
-sample has an undefined containment estimate. Such trials are **not replaced
-with 0 or 1**: `mean_est` and `mse` use only the defined estimates, and a warning
-reports the excluded count. Both statistics are `nan` if there are no valid
-trials. For an MSE over all 500 trials, ensure `valid_seeds` is 500. In particular,
-the default bottom-k `--k 50` can be too sparse at a 40-fold size imbalance;
-increase `--k` before comparing MSEs across algorithms. The two sample-size
-columns average the stored sketch sizes over all trials, not just valid trials.
-
-Containment synthesis streams distinct integer IDs through a seeded 64-bit
-permutation directly into the actual sketch implementations; shared elements
-receive identical hashes. It does not allocate a universal string pool or
-materialize A and B. The seed controls reproducibility. Runtime still includes
-all sketch updates in every trial, and FracMinHash memory still grows with its
-sampling rate and input size; a 500-seed, ten-step, 40-fold experiment is large.
-Existing Jaccard/cosine synthesis and TSV columns are unchanged.
-
-Run the dependency-free containment unit and CLI smoke tests with:
-
-```bash
-python3 test/test_containment.py
 ```
 
 ## Citing
