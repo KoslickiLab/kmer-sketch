@@ -94,9 +94,7 @@ This program computes pairwise similarity from a list of sketch files. The argum
 
 ## Citing
 
-*This work was accepted and presented at RECOMB 2025 and is now under review at Genome Research.*
-
 Please cite the following preprint if you use MaxGeomHash or α-MaxGeomHash.
 ```
-Hera, M. Rahman, Koslicki, D., & Martínez, C. (2025). MaxGeomHash: An algorithm for variable-size random sampling of distinct elements [Preprint]. bioRxiv. https://doi.org/10.1101/2025.11.11.687920
+Hera, M. Rahman, Koslicki, D., & Martínez, C. (2026). MaxGeomHash bridges MinHash and FracMinHash for scalable similarity estimation using sub-linear k-mer sketching. Genome Research. https://doi.org/10.1101/gr.282217.126
 ```
