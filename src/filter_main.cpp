@@ -147,6 +147,7 @@ int main(int argc, char** argv) {
                 for (auto& kv: r.alphamaxgeom->buckets()) size2 += kv.second.size();
             } else if (q.fracmh && r.fracmh) {
                 if (metric=="cosine") s = FracMinHash::cosine(*q.fracmh, *r.fracmh);
+                else if (metric=="containment") s = FracMinHash::containment_in(*r.fracmh, *q.fracmh);
                 else s = FracMinHash::jaccard(*q.fracmh, *r.fracmh);
                 size1 = q.fracmh->hashes().size(); size2 = r.fracmh->hashes().size();
                 for (auto x: q.fracmh->hashes()) if (r.fracmh->hashes().count(x)) ++inter;
@@ -157,7 +158,9 @@ int main(int argc, char** argv) {
                 for (size_t i=0;i<q.minhash->num_perm();++i) if (q.minhash->mins()[i]==r.minhash->mins()[i]) ++inter;
                 uni = q.minhash->num_perm();
             } else if (q.bottomk && r.bottomk) {
-                s = (metric=="cosine") ? BottomK::cosine(*q.bottomk, *r.bottomk) : BottomK::jaccard(*q.bottomk, *r.bottomk);
+                if (metric=="cosine") s = BottomK::cosine(*q.bottomk, *r.bottomk);
+                else if (metric=="containment") s = BottomK::containment_in(*r.bottomk, *q.bottomk);
+                else s = BottomK::jaccard(*q.bottomk, *r.bottomk);
                 size1 = q.bottomk->hashes().size(); size2 = r.bottomk->hashes().size();
                 for (auto x: q.bottomk->hashes()) if (r.bottomk->hashes().count(x)) ++inter;
                 uni = size1 + size2 - inter;
